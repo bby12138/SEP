@@ -170,20 +170,22 @@ async def create_or_register(student: StudentCreate, db_session: Session = Depen
     return {"message": "Student created/registered successfully"}
 
 
+# 修正后的登录接口，使其返回格式与前端匹配
 @router.post('/login')
 async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     student = authenticate_student(db, form_data.username, form_data.password)
     if not student:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
+            detail={"success": False, "message": "用户名或密码不正确"},
             headers={"WWW-Authenticate": "Bearer"},
         )
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={"sub": student.number}, expires_delta=access_token_expires
     )
-    return {"access_token": access_token, "token_type": "bearer"}
+    # 返回前端期望的格式
+    return {"success": True, "token": access_token}
 
 
 @router.post('/photo/')
@@ -271,7 +273,68 @@ async def get_student_photo(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# 优化后的人脸识别接口
+# 新增的 /attendance 接口，专门用于考勤
+@router.post("/attendance")
+async def attendance(image: UploadFile = File(...)):
+    temp_dir = os.path.join(IMAGE_DIR, "temp")
+    os.makedirs(temp_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    file_ext = os.path.splitext(image.filename)[1].lower()
+    if file_ext not in ['.jpg', '.jpeg', '.png', '.bmp']:
+        return {"result": "fail", "message": "不支持的文件格式，仅支持JPG、PNG、BMP格式"}
+
+    temp_image_filename = f"query_{timestamp}{file_ext}"
+    temp_image_path = os.path.join(temp_dir, temp_image_filename)
+
+    with open(temp_image_path, "wb") as f:
+        contents = await image.read()
+        f.write(contents)
+
+    face_path = os.path.join(temp_dir, f"query_face_{timestamp}{file_ext}")
+
+    # 优化后的文件清理逻辑
+    files_to_clean = [temp_image_path]
+
+    try:
+        face_detected = detect_and_crop_face(temp_image_path, face_path)
+        if face_detected:
+            query_image = face_path
+            files_to_clean.append(face_path)
+        else:
+            query_image = temp_image_path  # 即使没有裁剪，也需要清理原始文件
+            return {"result": "fail", "message": "未检测到人脸，请重新拍照"}
+
+        db = next(get_db())
+        students = db.query(Student).filter(Student.photo != None).all()
+        best_match = None
+        best_distance = float('inf')
+
+        for student in students:
+            if not student.photo or not os.path.isfile(student.photo):
+                continue
+
+            result = verify_faces(query_image, student.photo)
+
+            if result["verified"] and result["distance"] < best_distance:
+                best_distance = result["distance"]
+                best_match = student
+
+        if best_match and best_distance < RECOGNITION_THRESHOLD:
+            return {"result": "success", "message": f"签到成功，欢迎 {best_match.name}！"}
+        else:
+            return {"result": "fail", "message": "未识别到匹配的学生，请重新拍照"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"人脸识别处理错误: {str(e)}")
+    finally:
+        for file_path in files_to_clean:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception as e:
+                print(f"清理临时文件 {file_path} 时出错: {str(e)}")
+
+
 @router.post("/api/recognize")
 async def recognize(face_image: UploadFile = File(...)):
     # 创建临时目录
