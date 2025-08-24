@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Response, status, Request
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Response, status, Request, Form
 from typing import Dict, Optional, Any
 from datetime import datetime, timedelta
 import jwt
@@ -156,19 +156,58 @@ async def get_current_student(token: str = Depends(oauth2_scheme), db: Session =
     return student
 
 
-@router.post('/create_or_register')
-async def create_or_register(student: StudentCreate, db_session: Session = Depends(get_db)):
-    query = select(Student).where(Student.number == student.number)
-    records = db_session.execute(query).scalars().all()
-    if records:
-        raise HTTPException(status_code=400, detail=f'student  {student.number} already exists')
-    hashed_password = get_password_hash(student.password)
-    new_student = Student(name=student.name, number=student.number, password=hashed_password)
-    db_session.add(new_student)
-    db_session.commit()
-    db_session.refresh(new_student)
-    return {"message": "Student created/registered successfully"}
+@router.post('/register')
+async def register_student(
+    student_number: str = Form(...),
+    student_name: str = Form(...),
+    password: str = Form(...),
+    photo: UploadFile = File(...),
+    db_session: Session = Depends(get_db)
+):
+    """
+    處理註冊請求的 API 接口，接收表單數據和照片。
+    """
+    # 檢查學號是否已存在
+    existing_student = db_session.query(Student).filter(Student.number == student_number).first()
+    if existing_student:
+        return {"success": False, "message": "學號已存在"}
 
+    # 哈希密碼
+    hashed_password = get_password_hash(password)
+
+    # 保存照片到伺服器
+    upload_dir = "uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    # 使用學號作為照片文件名，確保唯一性
+    photo_filename = f"{student_number}.jpg"
+    photo_path = os.path.join(upload_dir, photo_filename)
+
+    try:
+        with open(photo_path, "wb") as buffer:
+            buffer.write(await photo.read())
+    except Exception as e:
+        return {"success": False, "message": f"無法保存照片: {str(e)}"}
+
+    # 創建新的學生記錄
+    new_student = Student(
+        name=student_name,
+        number=student_number,
+        password=hashed_password,
+        photo=photo_path
+    )
+
+    try:
+        db_session.add(new_student)
+        db_session.commit()
+        db_session.refresh(new_student)
+        # 返回成功響應，格式與前端的 RegistrationActivity 匹配
+        return {"success": True, "message": "註冊成功！"}
+    except Exception as e:
+        db_session.rollback()
+        # 清理已上傳的照片
+        if os.path.exists(photo_path):
+            os.remove(photo_path)
+        return {"success": False, "message": f"註冊失敗: {str(e)}"}
 
 # 修正后的登录接口，使其返回格式与前端匹配
 @router.post('/login')
