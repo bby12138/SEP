@@ -9,7 +9,9 @@ class StudentBase(BaseModel):
 
 class StudentCreate(StudentBase):
     password: str
+    # 新增: 注册时需要的班级代碼
+    class_code: str
 
 
 class StudentOut(StudentBase):
-    ...
+    pass

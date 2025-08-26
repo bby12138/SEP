@@ -12,3 +12,5 @@ class Student(Base):
     number: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     password: Mapped[str] = mapped_column(String(255), nullable=False)
     photo: Mapped[str] = mapped_column(String(255), nullable=True)
+    # 新增: 班级代碼，用于简化班级管理
+    class_code: Mapped[str] = mapped_column(String(255), nullable=False)

@@ -13,6 +13,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from deepface import DeepFace
 import numpy as np
 import cv2
+import shutil
 
 # 加密上下文，用于密码哈希和验证
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -33,405 +34,66 @@ RECOGNITION_THRESHOLD = 0.4  # 识别阈值，越小越严格
 router = APIRouter()
 
 
-# 工具函数：提取人脸特征
-def extract_face_features(image_path: str) -> list[dict[str, Any]] | None:
-    try:
-        # 使用DeepFace提取特征
-        face_obj = DeepFace.extract_faces(
-            img_path=image_path,
-            target_size=(224, 224),
-            detector_backend="opencv"
-        )
-
-        if not face_obj:
-            return None
-
-        # 返回第一个检测到的人脸的特征向量
-        return DeepFace.represent(
-            img_path=face_obj[0]["face"],
-            model_name=RECOGNITION_MODEL,
-            enforce_detection=False
-        )
-    except Exception as e:
-        print(f"特征提取错误: {str(e)}")
-        return None
-
-
 # 工具函数：验证人脸相似度
-def verify_faces(img1_path: str, img2_path: str) -> Dict:
+def verify_faces(img1_path: str, img2_path: str):
+    """比较两张图片中的人脸相似度"""
     try:
-        # 使用DeepFace验证两张人脸
-        return DeepFace.verify(
-            img1_path=img1_path,
-            img2_path=img2_path,
-            model_name=RECOGNITION_MODEL,
-            distance_metric=DISTANCE_METRIC,
-            enforce_detection=False
-        )
+        result = DeepFace.verify(img1_path, img2_path, model_name=RECOGNITION_MODEL, distance_metric=DISTANCE_METRIC)
+        return result
     except Exception as e:
-        print(f"人脸验证错误: {str(e)}")
+        print(f"人脸验证失败: {e}")
         return {"verified": False, "distance": float('inf')}
 
 
-# 工具函数：检测并裁剪人脸
-def detect_and_crop_face(image_path: str, output_path: str) -> bool:
-    try:
-        # 读取图像
-        img = cv2.imread(image_path)
-        if img is None:
-            return False
-
-        # 转换为灰度图像
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        # 使用OpenCV的人脸检测器
-        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-
-        if len(faces) == 0:
-            return False
-
-        # 获取第一个检测到的人脸
-        (x, y, w, h) = faces[0]
-
-        # 裁剪人脸区域并保存
-        face_roi = img[y:y + h, x:x + w]
-        cv2.imwrite(output_path, face_roi)
-
-        return True
-    except Exception as e:
-        print(f"人脸检测和裁剪错误: {str(e)}")
-        return False
-
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
-
-def get_student_by_number(db: Session, number: str):
-    query = select(Student).where(Student.number == number)
-    return db.execute(query).scalars().first()
-
-
-def authenticate_student(db: Session, number: str, password: str):
-    student = get_student_by_number(db, number)
-    if not student:
-        return False
-    if not verify_password(password, student.password):
-        return False
-    return student
-
-
-async def get_current_student(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        number: str = payload.get("sub")
-        if number is None:
-            raise credentials_exception
-    except jwt.PyJWTError:
-        raise credentials_exception
-    student = get_student_by_number(db, number)
-    if student is None:
-        raise credentials_exception
-    return student
-
-
-@router.post('/register')
-async def register_student(
-    student_number: str = Form(...),
-    student_name: str = Form(...),
-    password: str = Form(...),
-    photo: UploadFile = File(...),
-    db_session: Session = Depends(get_db)
+# 精簡後的人臉識別路由
+@router.post("/recognize")
+async def recognize_face(
+        photo: UploadFile = File(...),
+        class_code: str = Form(...),
+        db: Session = Depends(get_db)
 ):
-    """
-    處理註冊請求的 API 接口，接收表單數據和照片。
-    """
-    # 檢查學號是否已存在
-    existing_student = db_session.query(Student).filter(Student.number == student_number).first()
-    if existing_student:
-        return {"success": False, "message": "學號已存在"}
-
-    # 哈希密碼
-    hashed_password = get_password_hash(password)
-
-    # 保存照片到伺服器
-    upload_dir = "uploads"
-    os.makedirs(upload_dir, exist_ok=True)
-    # 使用學號作為照片文件名，確保唯一性
-    photo_filename = f"{student_number}.jpg"
-    photo_path = os.path.join(upload_dir, photo_filename)
-
     try:
-        with open(photo_path, "wb") as buffer:
-            buffer.write(await photo.read())
-    except Exception as e:
-        return {"success": False, "message": f"無法保存照片: {str(e)}"}
+        if not class_code:
+            raise HTTPException(status_code=400, detail="班级代碼不能为空")
 
-    # 創建新的學生記錄
-    new_student = Student(
-        name=student_name,
-        number=student_number,
-        password=hashed_password,
-        photo=photo_path
-    )
+        # 保存上传的考勤照片
+        temp_photo_path = os.path.join(IMAGE_DIR, f"temp_{photo.filename}")
+        with open(temp_photo_path, "wb") as buffer:
+            shutil.copyfileobj(photo.file, buffer)
 
-    try:
-        db_session.add(new_student)
-        db_session.commit()
-        db_session.refresh(new_student)
-        # 返回成功響應，格式與前端的 RegistrationActivity 匹配
-        return {"success": True, "message": "註冊成功！"}
-    except Exception as e:
-        db_session.rollback()
-        # 清理已上傳的照片
-        if os.path.exists(photo_path):
-            os.remove(photo_path)
-        return {"success": False, "message": f"註冊失敗: {str(e)}"}
+        # 在指定班级中查找所有学生
+        students_in_class = db.scalars(select(Student).where(Student.class_code == class_code)).all()
 
-# 修正后的登录接口，使其返回格式与前端匹配
-@router.post('/login')
-async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    student = authenticate_student(db, form_data.username, form_data.password)
-    if not student:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"success": False, "message": "用户名或密码不正确"},
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": student.number}, expires_delta=access_token_expires
-    )
-    # 返回前端期望的格式
-    return {"success": True, "token": access_token}
+        if not students_in_class:
+            os.remove(temp_photo_path)
+            return {"recognized": False, "message": "该班级没有学生数据，无法进行考勤。"}
 
-
-@router.post('/photo/')
-async def upload_photos(
-        file: UploadFile = File(...),
-        db_session: Session = Depends(get_db),
-        current_student: Student = Depends(get_current_student)
-):
-    # 1. 查询学生是否存在
-    student = current_student
-
-    # 2. 保存文件到服务器
-    upload_dir = "uploads"
-    os.makedirs(upload_dir, exist_ok=True)
-
-    # 生成唯一文件名
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    file_ext = os.path.splitext(file.filename)[1].lower()
-    unique_filename = f"student_{student.id}_{timestamp}{file_ext}"
-    file_path = os.path.join(upload_dir, unique_filename)
-
-    # 保存原始文件
-    with open(file_path, "wb") as buffer:
-        buffer.write(await file.read())
-
-    # 3. 检测并裁剪人脸（可选步骤）
-    face_cropped = False
-    face_path = None
-    if file_ext in ['.jpg', '.jpeg', '.png']:
-        face_filename = f"face_{student.id}_{timestamp}{file_ext}"
-        face_path = os.path.join(upload_dir, face_filename)
-        face_cropped = detect_and_crop_face(file_path, face_path)
-
-    try:
-        # 4. 更新学生照片路径
-        student.photo = face_path if face_cropped else file_path
-        db_session.commit()
-        db_session.refresh(student)
-    except Exception as e:
-        db_session.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-    return {"message": "Photo updated successfully", "face_detected": face_cropped}
-
-
-@router.get('/getstudent', response_model=StudentOut)
-async def get_student(
-        current_student: Student = Depends(get_current_student)
-):
-    return current_student
-
-
-@router.get('/student/photo')
-async def get_student_photo(
-        current_student: Student = Depends(get_current_student)
-):
-    if not current_student.photo:
-        raise HTTPException(status_code=404, detail='Photo not found')
-
-    try:
-        # 检查文件是否存在
-        if not os.path.isfile(current_student.photo):
-            raise FileNotFoundError
-
-        # 获取文件扩展名以确定媒体类型
-        file_extension = os.path.splitext(current_student.photo)[1].lower()
-        if file_extension == '.jpg' or file_extension == '.jpeg':
-            media_type = 'image/jpeg'
-        elif file_extension == '.png':
-            media_type = 'image/png'
-        elif file_extension == '.gif':
-            media_type = 'image/gif'
-        else:
-            raise HTTPException(status_code=400, detail='Unsupported image type')
-
-        with open(current_student.photo, "rb") as file:
-            photo_data = file.read()
-        return Response(
-            content=photo_data,
-            media_type=media_type
-        )
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail='Photo not found')
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# 新增的 /attendance 接口，专门用于考勤
-@router.post("/attendance")
-async def attendance(image: UploadFile = File(...)):
-    temp_dir = os.path.join(IMAGE_DIR, "temp")
-    os.makedirs(temp_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    file_ext = os.path.splitext(image.filename)[1].lower()
-    if file_ext not in ['.jpg', '.jpeg', '.png', '.bmp']:
-        return {"result": "fail", "message": "不支持的文件格式，仅支持JPG、PNG、BMP格式"}
-
-    temp_image_filename = f"query_{timestamp}{file_ext}"
-    temp_image_path = os.path.join(temp_dir, temp_image_filename)
-
-    with open(temp_image_path, "wb") as f:
-        contents = await image.read()
-        f.write(contents)
-
-    face_path = os.path.join(temp_dir, f"query_face_{timestamp}{file_ext}")
-
-    # 优化后的文件清理逻辑
-    files_to_clean = [temp_image_path]
-
-    try:
-        face_detected = detect_and_crop_face(temp_image_path, face_path)
-        if face_detected:
-            query_image = face_path
-            files_to_clean.append(face_path)
-        else:
-            query_image = temp_image_path  # 即使没有裁剪，也需要清理原始文件
-            return {"result": "fail", "message": "未检测到人脸，请重新拍照"}
-
-        db = next(get_db())
-        students = db.query(Student).filter(Student.photo != None).all()
-        best_match = None
-        best_distance = float('inf')
-
-        for student in students:
-            if not student.photo or not os.path.isfile(student.photo):
-                continue
-
-            result = verify_faces(query_image, student.photo)
-
-            if result["verified"] and result["distance"] < best_distance:
-                best_distance = result["distance"]
-                best_match = student
-
-        if best_match and best_distance < RECOGNITION_THRESHOLD:
-            return {"result": "success", "message": f"签到成功，欢迎 {best_match.name}！"}
-        else:
-            return {"result": "fail", "message": "未识别到匹配的学生，请重新拍照"}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"人脸识别处理错误: {str(e)}")
-    finally:
-        for file_path in files_to_clean:
-            try:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-            except Exception as e:
-                print(f"清理临时文件 {file_path} 时出错: {str(e)}")
-
-
-@router.post("/api/recognize")
-async def recognize(face_image: UploadFile = File(...)):
-    # 创建临时目录
-    temp_dir = os.path.join(IMAGE_DIR, "temp")
-    os.makedirs(temp_dir, exist_ok=True)
-
-    # 保存上传的图片
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    file_ext = os.path.splitext(face_image.filename)[1].lower()
-
-    # 确保文件扩展名是有效的图片格式
-    if file_ext not in ['.jpg', '.jpeg', '.png', '.bmp']:
-        return {"recognized": False, "message": "不支持的文件格式，仅支持JPG、PNG、BMP格式"}
-
-    temp_image_filename = f"query_{timestamp}{file_ext}"
-    temp_image_path = os.path.join(temp_dir, temp_image_filename)
-
-    # 保存上传的图片
-    with open(temp_image_path, "wb") as f:
-        contents = await face_image.read()
-        f.write(contents)
-
-    # 人脸检测和裁剪
-    face_detected = False
-    face_path = os.path.join(temp_dir, f"query_face_{timestamp}{file_ext}")
-
-    if detect_and_crop_face(temp_image_path, face_path):
-        query_image = face_path
+        # 检查上传的照片中是否有人脸
         face_detected = True
-    else:
-        # 如果无法检测到人脸，使用原始图像
-        query_image = temp_image_path
+        try:
+            detected_faces = DeepFace.extract_faces(temp_photo_path, detector_backend='opencv', enforce_detection=True)
+            if not detected_faces:
+                face_detected = False
+        except Exception:
+            face_detected = False
 
-    try:
-        db = next(get_db())
+        if not face_detected:
+            os.remove(temp_photo_path)
+            return {"recognized": False, "message": "未在照片中检测到人脸，考勤失败。"}
 
-        # 获取所有已注册且有照片的学生
-        students = db.query(Student).filter(Student.photo != None).all()
-
+        # 对比上传照片与班级中每个学生的照片
         best_match = None
         best_distance = float('inf')
 
-        # 遍历所有学生进行比对
-        for student in students:
-            if not student.photo or not os.path.isfile(student.photo):
-                continue
+        for student in students_in_class:
+            if student.photo and os.path.exists(os.path.join(IMAGE_DIR, student.photo)):
+                result = verify_faces(temp_photo_path, os.path.join(IMAGE_DIR, student.photo))
+                if result["verified"] and result["distance"] < best_distance:
+                    best_distance = result["distance"]
+                    best_match = student
 
-            # 验证人脸相似度
-            result = verify_faces(query_image, student.photo)
-
-            if result["verified"] and result["distance"] < best_distance:
-                best_distance = result["distance"]
-                best_match = student
-
-        # 计算置信度 (距离越小，置信度越高)
+        # 计算置信度并返回结果
         confidence = 1.0 - min(best_distance / RECOGNITION_THRESHOLD, 1.0) if best_match else 0.0
-
-        # 判断是否识别成功
         recognized = best_match is not None and best_distance < RECOGNITION_THRESHOLD
 
         response_data = {
@@ -446,23 +108,104 @@ async def recognize(face_image: UploadFile = File(...)):
             response_data.update({
                 "student_id": best_match.id,
                 "student_number": best_match.number,
-                "student_name": best_match.name
+                "student_name": best_match.name,
+                "message": "人脸识别成功"  # 成功时返回简短的成功訊息
             })
         else:
             response_data.update({
-                "message": "未识别到匹配的学生"
+                "message": "人脸不匹配，考勤失败"
             })
 
         return response_data
 
+    except HTTPException as e:
+        return {"recognized": False, "message": e.detail}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"人脸识别处理错误: {str(e)}")
     finally:
         # 清理临时文件
         try:
-            if os.path.exists(temp_image_path):
-                os.remove(temp_image_path)
-            if os.path.exists(face_path):
-                os.remove(face_path)
+            if 'temp_photo_path' in locals() and os.path.exists(temp_photo_path):
+                os.remove(temp_photo_path)
         except Exception as e:
-            print(f"清理临时文件时出错: {str(e)}")
+            print(f"清理临时文件失败: {e}")
+
+
+@router.post("/register")
+async def register_student(
+        name: str = Form(...),
+        student_number: str = Form(...),
+        password: str = Form(...),
+        role: str = Form(...),
+        class_code: Optional[str] = Form(None),
+        photo: Optional[UploadFile] = File(None),
+        db: Session = Depends(get_db)
+):
+    """
+    注册新用户 (学生或教师)
+    """
+    if role == "student":
+        if not photo or not class_code:
+            raise HTTPException(status_code=400, detail="学生注册需要照片和班级代碼。")
+
+        existing_student = db.scalar(select(Student).where(Student.number == student_number))
+        if existing_student:
+            raise HTTPException(status_code=409, detail="学号已存在。")
+
+        photo_filename = f"{student_number}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
+        photo_path = os.path.join(IMAGE_DIR, photo_filename)
+        with open(photo_path, "wb") as buffer:
+            shutil.copyfileobj(photo.file, buffer)
+
+        db_student = Student(
+            number=student_number,
+            name=name,
+            password=pwd_context.hash(password),
+            photo=photo_filename,
+            class_code=class_code
+        )
+
+        db.add(db_student)
+        db.commit()
+        db.refresh(db_student)
+        return {"success": True, "message": "註冊成功！"}
+
+    elif role == "teacher":
+        return {"success": True, "message": "教師註冊成功！"}
+
+    else:
+        raise HTTPException(status_code=400, detail="無效的角色。")
+
+
+@router.post("/login")
+async def login_for_access_token(
+        request: Request,
+        form_data: OAuth2PasswordRequestForm = Depends(),
+        db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """
+    用户登录并返回 JWT token
+    """
+    student = db.scalar(select(Student).where(Student.number == form_data.username))
+    if not student or not pwd_context.verify(form_data.password, student.password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="用户名或密码错误",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = jwt.encode(
+        {"sub": student.number, "id": student.id, "exp": datetime.utcnow() + access_token_expires},
+        SECRET_KEY,
+        algorithm=ALGORITHM
+    )
+
+    return {
+        "message": "登入成功",
+        "token": access_token,
+        "role": "student",
+        "id": student.id,
+        "class_code": student.class_code,
+        "student_name": student.name
+    }
